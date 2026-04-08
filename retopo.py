@@ -124,8 +124,8 @@ def retopologize(input_path, output_path, target_tris=4000):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Retopologize mesh for Roblox')
-    parser.add_argument('input', help='Input mesh file (GLB/OBJ/PLY)')
-    parser.add_argument('output', help='Output mesh file')
+    parser.add_argument('--input', required=True, help='Input mesh file (GLB/OBJ/PLY)')
+    parser.add_argument('--output', required=True, help='Output mesh file')
     parser.add_argument('--target-tris', type=int, default=4000,
                         help='Target triangle count (default: 4000)')
     args = parser.parse_args()
