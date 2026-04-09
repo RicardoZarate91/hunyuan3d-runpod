@@ -29,17 +29,22 @@ RUN git clone --depth 1 https://github.com/Tencent-Hunyuan/Hunyuan3D-Omni.git /a
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install Python dependencies (matches Hunyuan3D-Omni requirements.txt)
 RUN pip install --no-cache-dir \
     ninja pybind11 \
     diffusers==0.30.0 einops opencv-python-headless \
-    numpy transformers==4.46.0 \
-    omegaconf tqdm trimesh pymeshlab==2023.12.post3 \
+    numpy==1.24.4 scipy==1.14.1 transformers==4.46.0 \
+    omegaconf pyyaml tqdm trimesh pymeshlab==2023.12.post3 \
     pygltflib xatlas accelerate==1.1.1 \
+    pytorch-lightning==1.9.5 torchdiffeq==0.2.5 timm==1.0.20 \
     rembg onnxruntime \
     safetensors huggingface_hub hf_transfer \
     imageio pillow psutil \
     open3d==0.19.0 cupy-cuda12x==13.4.1
+
+# Install torchaudio (CUDA 12.4, same index as torch)
+RUN pip install --no-cache-dir \
+    torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 
 # Install RunPod SDK
 RUN pip install --no-cache-dir runpod
