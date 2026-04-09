@@ -43,26 +43,22 @@ import tempfile
 import time
 import traceback
 
-# Global model pipelines (loaded once, reused across requests)
+# Global model pipeline (loaded once, reused across requests)
 shape_pipeline = None
-paint_pipeline = None
 
 
 def load_models():
-    """Load Hunyuan3D-Omni (shape) + Paint-v2-1 (texture). Called once on cold start."""
-    global shape_pipeline, paint_pipeline
+    """Load Hunyuan3D-Omni shape model. Called once on cold start."""
+    global shape_pipeline
 
     if shape_pipeline is not None:
         return
 
     import sys
     sys.path.insert(0, '/app/omni')
-    sys.path.insert(0, '/app/paint')
-    sys.path.insert(0, '/app/paint/hy3dpaint')
 
     import torch
 
-    # ── Load Omni shape pipeline ──
     print("[omni] Loading Hunyuan3D-Omni shape model...")
     t0 = time.time()
 
@@ -72,24 +68,7 @@ def load_models():
         '/app/weights/Hunyuan3D-Omni',
     )
 
-    print(f"[omni] Shape model loaded in {time.time()-t0:.1f}s")
-
-    # ── Load Paint PBR texture pipeline ──
-    print("[omni] Loading Hunyuan3D Paint-v2-1 texture model...")
-    t1 = time.time()
-
-    try:
-        from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
-
-        paint_config = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
-        paint_pipeline = Hunyuan3DPaintPipeline(paint_config)
-        print(f"[omni] Paint model loaded in {time.time()-t1:.1f}s")
-    except Exception as e:
-        print(f"[omni] WARNING: Paint pipeline failed to load: {e}")
-        print("[omni] Texture generation will be unavailable. Shape-only mode.")
-        paint_pipeline = None
-
-    print(f"[omni] All models ready ({time.time()-t0:.1f}s total)")
+    print(f"[omni] Shape model loaded in {time.time()-t0:.1f}s (10GB VRAM)")
 
 
 def handler(job):
@@ -115,7 +94,6 @@ def handler(job):
     steps = inp.get("steps", 30)
     guidance_scale = inp.get("guidance_scale", 4.5)
     octree_resolution = inp.get("octree_resolution", 512)
-    do_texture = inp.get("texture", True)
     face_count = inp.get("face_count", 90000)
     control_type = inp.get("control_type", "none")
 
@@ -186,38 +164,10 @@ def handler(job):
             _ = mesh.vertex_normals
             print(f"[omni] Smooth vertex normals computed")
 
-        # Export shape as OBJ (paint pipeline needs OBJ path)
-        shape_obj_path = os.path.join(work_dir, "shape.obj")
-        mesh.export(shape_obj_path)
-
-        # Also export untextured GLB
-        untextured_path = os.path.join(work_dir, "untextured.glb")
-        mesh.export(untextured_path, include_normals=True)
-
-        # ── Texture generation with Paint-v2-1 ──
-        tex_time = 0
-        glb_path = untextured_path
-
-        if do_texture and paint_pipeline:
-            print("[omni] Generating PBR textures...")
-            t1 = time.time()
-
-            try:
-                textured_path = os.path.join(work_dir, "output.glb")
-                paint_pipeline(
-                    mesh_path=shape_obj_path,
-                    image_path=image_path,
-                    output_mesh_path=textured_path,
-                    save_glb=True,
-                )
-                glb_path = textured_path
-                tex_time = time.time() - t1
-                print(f"[omni] PBR texture done in {tex_time:.1f}s")
-            except Exception as e:
-                print(f"[omni] Texture failed, using untextured: {e}")
-                tex_time = 0
-        elif do_texture and not paint_pipeline:
-            print("[omni] Paint pipeline not loaded, returning untextured mesh")
+        # Export GLB
+        glb_path = os.path.join(work_dir, "output.glb")
+        mesh.export(glb_path, include_normals=True)
+        # TODO: Add Paint-v2-1 PBR texture pipeline once CUDA extensions are resolved
 
         # Read GLB
         with open(glb_path, "rb") as f:
@@ -244,13 +194,12 @@ def handler(job):
             "faces": n_faces,
             "vertices": n_verts,
             "shape_time_sec": round(shape_time, 1),
-            "texture_time_sec": round(tex_time, 1),
-            "total_inference_sec": round(shape_time + tex_time, 1),
+            "total_inference_sec": round(shape_time, 1),
             "glb_size_bytes": len(glb_data),
             "seed": seed,
             "steps": steps,
             "octree_resolution": octree_resolution,
-            "textured": do_texture and tex_time > 0,
+            "textured": False,  # TODO: Paint-v2-1 PBR textures coming soon
             "control_type": control_type,
             "model": "hunyuan3d-omni",
         }

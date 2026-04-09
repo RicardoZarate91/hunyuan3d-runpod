@@ -24,14 +24,12 @@ RUN pip install --no-cache-dir \
     torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 
 # ── Clone Hunyuan3D-Omni (shape generation with controls) ──
+# No CUDA extensions needed — pure Python/PyTorch
 RUN git clone --depth 1 https://github.com/Tencent-Hunyuan/Hunyuan3D-Omni.git /app/omni
-
-# ── Clone Hunyuan3D-2.1 (texture/paint pipeline only) ──
-RUN git clone --depth 1 https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git /app/paint
 
 WORKDIR /app
 
-# Install Python dependencies (merged from both repos)
+# Install Python dependencies
 RUN pip install --no-cache-dir \
     ninja pybind11 \
     diffusers==0.30.0 einops opencv-python-headless \
@@ -41,35 +39,16 @@ RUN pip install --no-cache-dir \
     rembg onnxruntime \
     safetensors huggingface_hub hf_transfer \
     imageio pillow psutil \
-    open3d==0.19.0 cupy-cuda12x==13.4.1 \
-    realesrgan pytorch-lightning==1.9.5
-
-# Build CUDA extensions for Paint pipeline (texture generation)
-# Omni (shape) needs NO CUDA extensions
-RUN python3 -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')" \
-    && cd /app/paint/hy3dpaint/custom_rasterizer && pip install --no-build-isolation -e . \
-    && cd /app/paint/hy3dpaint/DifferentiableRenderer && bash compile_mesh_painter.sh
+    open3d==0.19.0 cupy-cuda12x==13.4.1
 
 # Install RunPod SDK
 RUN pip install --no-cache-dir runpod
 
-# ── Download model weights (baked into image for fast cold starts) ──
-# Omni shape model (~13GB)
+# ── Download Omni shape model weights (~13GB, baked for fast cold starts) ──
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('tencent/Hunyuan3D-Omni', local_dir='/app/weights/Hunyuan3D-Omni'); \
 print('Omni shape model downloaded!')"
-
-# Paint PBR texture model (~5GB for paint subfolder)
-RUN python3 -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('tencent/Hunyuan3D-2.1', local_dir='/app/weights/Hunyuan3D-2.1'); \
-print('Paint PBR model downloaded!')"
-
-# Download RealESRGAN weights (needed by paint pipeline)
-RUN mkdir -p /app/paint/hy3dpaint/ckpt && \
-    wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth \
-    -O /app/paint/hy3dpaint/ckpt/RealESRGAN_x4plus.pth
 
 # Copy our handler + Roblox pipeline
 COPY handler.py /app/handler.py
@@ -86,7 +65,7 @@ COPY roblox-templates/ /opt/roblox-templates/
 ENV PYOPENGL_PLATFORM=egl
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
-# Make both packages importable
-ENV PYTHONPATH="/app/omni:/app/paint"
+# Make Omni package importable
+ENV PYTHONPATH="/app/omni"
 
 CMD ["python3", "/app/handler.py"]
