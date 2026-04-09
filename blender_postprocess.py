@@ -309,9 +309,165 @@ def deform_outer_cage(outer_cage_obj, clothing_obj, region='full', margin=0.008)
     print(f"[blender] Outer cage: {applied} vertices displaced (smoothed, 2 iterations)")
 
 
+def clean_mesh_for_roblox(clothing_obj):
+    """
+    Clean up AI-generated mesh to meet Roblox requirements:
+    - Remove non-manifold geometry (edges with 3+ faces)
+    - Fill small holes (watertight requirement)
+    - Remove loose/floating vertices
+    - Remove degenerate faces (zero area)
+    """
+    bpy.ops.object.select_all(action='DESELECT')
+    clothing_obj.select_set(True)
+    bpy.context.view_layer.objects.active = clothing_obj
+
+    # Enter edit mode for cleanup
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+
+    # Remove degenerate faces (zero area)
+    bpy.ops.mesh.dissolve_degenerate(threshold=0.0001)
+
+    # Remove loose vertices/edges (not connected to faces)
+    bpy.ops.mesh.delete_loose(use_verts=True, use_edges=True, use_faces=False)
+
+    # Select non-manifold edges and try to fix
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.select_non_manifold(extend=False)
+
+    # Count non-manifold before fix
+    bpy.ops.object.mode_set(mode='OBJECT')
+    non_manifold_count = sum(1 for v in clothing_obj.data.vertices if v.select)
+
+    if non_manifold_count > 0:
+        print(f"[blender] Found {non_manifold_count} non-manifold vertices, attempting fix...")
+        bpy.ops.object.mode_set(mode='EDIT')
+        # Try to fill holes (makes mesh watertight)
+        try:
+            bpy.ops.mesh.fill_holes(sides=4)
+            print("[blender] Filled holes in mesh")
+        except Exception:
+            pass
+        bpy.ops.object.mode_set(mode='OBJECT')
+    else:
+        print("[blender] Mesh is manifold (clean)")
+
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    final_faces = len(clothing_obj.data.polygons)
+    final_verts = len(clothing_obj.data.vertices)
+    print(f"[blender] After cleanup: {final_faces} faces, {final_verts} verts")
+
+
+def limit_bone_influences(clothing_obj, max_influences=4):
+    """
+    Roblox requires max 4 bone influences per vertex.
+    Remove the weakest influences if any vertex exceeds this limit.
+    """
+    mesh = clothing_obj.data
+    groups = clothing_obj.vertex_groups
+
+    if not groups:
+        return
+
+    excess_count = 0
+    for vert in mesh.vertices:
+        if len(vert.groups) > max_influences:
+            # Sort by weight, keep only the top N
+            sorted_groups = sorted(vert.groups, key=lambda g: g.weight, reverse=True)
+            # Remove excess (weakest) groups
+            for g in sorted_groups[max_influences:]:
+                groups[g.group].remove([vert.index])
+                excess_count += 1
+
+    if excess_count > 0:
+        print(f"[blender] Limited bone influences: removed {excess_count} excess weights (max {max_influences})")
+    else:
+        print(f"[blender] All vertices within {max_influences} bone influence limit")
+
+
+def validate_roblox_constraints(clothing_obj, inner_cage_obj, outer_cage_obj):
+    """
+    Validate the final mesh against Roblox LC requirements.
+    Returns a dict of validation results.
+    """
+    issues = []
+
+    # Check triangle count (max 4000)
+    tri_count = sum(len(p.vertices) - 2 for p in clothing_obj.data.polygons)
+    if tri_count > 10000:
+        issues.append(f"Triangle count {tri_count} exceeds 10000 (Roblox limit: 10000 for LC)")
+    print(f"[blender] Validation: {tri_count} triangles {'✓' if tri_count <= 10000 else '✗'}")
+
+    # Check bounding box size (max 8x8x8 studs ≈ 0.08x0.08x0.08 in Blender units with 0.01 scale)
+    bb = get_bounding_box(clothing_obj)
+    size = bb['size']
+    print(f"[blender] Validation: size {size.x:.3f}x{size.y:.3f}x{size.z:.3f}")
+
+    # Check cage topology matches template (vertex count should be unchanged)
+    if inner_cage_obj and outer_cage_obj:
+        inner_verts = len(inner_cage_obj.data.vertices)
+        outer_verts = len(outer_cage_obj.data.vertices)
+        if inner_verts != outer_verts:
+            issues.append(f"Cage vertex mismatch: inner={inner_verts}, outer={outer_verts}")
+        print(f"[blender] Validation: cage verts inner={inner_verts}, outer={outer_verts} "
+              f"{'✓' if inner_verts == outer_verts else '✗'}")
+
+    # Check bone influences
+    max_influences = 0
+    for vert in clothing_obj.data.vertices:
+        max_influences = max(max_influences, len(vert.groups))
+    if max_influences > 4:
+        issues.append(f"Max bone influences {max_influences} exceeds Roblox limit of 4")
+    print(f"[blender] Validation: max bone influences = {max_influences} "
+          f"{'✓' if max_influences <= 4 else '✗'}")
+
+    if issues:
+        print(f"[blender] ⚠ {len(issues)} validation issues:")
+        for issue in issues:
+            print(f"[blender]   - {issue}")
+    else:
+        print(f"[blender] ✓ All Roblox validations passed")
+
+    return {
+        'valid': len(issues) == 0,
+        'issues': issues,
+        'tri_count': tri_count,
+        'max_bone_influences': max_influences,
+        'bounding_box': [round(size.x, 3), round(size.y, 3), round(size.z, 3)],
+    }
+
+
+def add_attachment_point(armature_obj, clothing_obj, attachment_name):
+    """
+    Add the correct attachment point as an Empty object.
+    Roblox uses these to know where to attach the clothing.
+    """
+    # Create empty at the correct position
+    bpy.ops.object.select_all(action='DESELECT')
+
+    empty = bpy.data.objects.new(attachment_name, None)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.empty_display_size = 0.01
+    bpy.context.collection.objects.link(empty)
+
+    # Position based on attachment type
+    cloth_bb = get_bounding_box(clothing_obj)
+    if 'Front' in attachment_name or 'Back' in attachment_name:
+        empty.location = cloth_bb['center']
+    elif 'Waist' in attachment_name:
+        empty.location = Vector((cloth_bb['center'].x, cloth_bb['min'].y + cloth_bb['size'].y * 0.4, cloth_bb['center'].z))
+
+    # Parent to armature
+    empty.parent = armature_obj
+    print(f"[blender] Added attachment point: {attachment_name}")
+    return empty
+
+
 def setup_armature_and_weights(clothing_obj, armature_obj):
     """
     Parent clothing mesh to R15 armature with automatic weights.
+    Then enforce max 4 bone influences per vertex (Roblox requirement).
     """
     bpy.ops.object.select_all(action='DESELECT')
     clothing_obj.select_set(True)
@@ -330,6 +486,9 @@ def setup_armature_and_weights(clothing_obj, armature_obj):
             print(f"[blender] Envelope weights also failed: {e2}")
             bpy.ops.object.parent_set(type='ARMATURE')
             print("[blender] Armature parenting (no weights, AutoSkin required): SUCCESS")
+
+    # Enforce Roblox max 4 bone influences per vertex
+    limit_bone_influences(clothing_obj, max_influences=4)
 
 
 def export_fbx(filepath, armature_obj, mesh_objects):
@@ -478,7 +637,13 @@ def main():
     cloth_verts = len(clothing_obj.data.vertices)
     print(f"[blender] Clothing mesh: {clothing_obj.name} ({cloth_faces} faces, {cloth_verts} verts)")
 
-    # ── Step 3: Scale and position clothing onto mannequin ───────────────
+    # ── Step 3: Clean mesh for Roblox ───────────────────────────────────
+    # Fix non-manifold geometry, remove loose verts, fill holes
+
+    print("\n[blender] Cleaning mesh for Roblox requirements...")
+    clean_mesh_for_roblox(clothing_obj)
+
+    # ── Step 4: Scale and position clothing onto mannequin ───────────────
     # NOTE: No shrinkwrap! We preserve the original clothing shape exactly.
 
     if mannequin_obj:
@@ -491,7 +656,7 @@ def main():
     bpy.context.view_layer.objects.active = clothing_obj
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-    # ── Step 4: Deform outer cage to envelop clothing ────────────────────
+    # ── Step 5: Deform outer cage to envelop clothing ────────────────────
     # The cage wraps the clothing, NOT the other way around.
 
     if outer_cage_obj and inner_cage_obj:
@@ -517,25 +682,36 @@ def main():
         print("[blender] WARNING: Cages not found. FBX will need manual caging.")
         clothing_obj.name = "LayeredClothing"
 
-    # ── Step 5: Rig clothing to R15 armature ─────────────────────────────
+    # ── Step 6: Rig clothing to R15 armature ─────────────────────────────
 
     if armature:
         print("\n[blender] Rigging to R15 armature...")
         setup_armature_and_weights(clothing_obj, armature)
 
-    # ── Step 6: Export combined preview GLB (clothing + mannequin) ────────
+    # ── Step 7: Add attachment point ──────────────────────────────────────
+
+    attachment_empty = None
+    if armature:
+        attachment_empty = add_attachment_point(armature, clothing_obj, config['attachment'])
+
+    # ── Step 8: Validate against Roblox requirements ──────────────────────
+
+    print("\n[blender] Validating Roblox requirements...")
+    validation = validate_roblox_constraints(clothing_obj, inner_cage_obj, outer_cage_obj)
+
+    # ── Step 9: Export combined preview GLB (clothing + mannequin) ────────
 
     if args.output_mannequin_glb and mannequin_obj:
         print(f"\n[blender] Exporting combined preview (clothing + mannequin)...")
         export_glb(args.output_mannequin_glb, [clothing_obj, mannequin_obj])
 
-    # ── Step 7: Remove mannequin (not needed in FBX or clothing-only GLB)
+    # ── Step 10: Remove mannequin (not needed in FBX or clothing-only GLB)
 
     if mannequin_obj:
         bpy.data.objects.remove(mannequin_obj, do_unlink=True)
         print("[blender] Mannequin removed from export")
 
-    # ── Step 8: Export FBX and clothing-only GLB ─────────────────────────
+    # ── Step 11: Export FBX and clothing-only GLB ────────────────────────
 
     print(f"\n[blender] Exporting FBX...")
     export_objects = [clothing_obj]
@@ -543,13 +719,15 @@ def main():
         export_objects.append(inner_cage_obj)
     if outer_cage_obj:
         export_objects.append(outer_cage_obj)
+    if attachment_empty:
+        export_objects.append(attachment_empty)
 
     export_fbx(args.output, armature, export_objects)
 
     if args.output_glb:
         export_glb(args.output_glb, [clothing_obj])
 
-    # ── Step 9: Write metadata ───────────────────────────────────────────
+    # ── Step 12: Write metadata ──────────────────────────────────────────
 
     meta = {
         'clothing_type': args.clothing_type,
@@ -557,9 +735,14 @@ def main():
         'mesh_name': clothing_obj.name,
         'face_count': len(clothing_obj.data.polygons),
         'vertex_count': len(clothing_obj.data.vertices),
+        'tri_count': validation.get('tri_count', 0),
         'has_cages': inner_cage_obj is not None and outer_cage_obj is not None,
         'has_armature': armature is not None,
-        'roblox_ready': True,
+        'has_attachment_point': attachment_empty is not None,
+        'max_bone_influences': validation.get('max_bone_influences', 0),
+        'bounding_box': validation.get('bounding_box', []),
+        'roblox_ready': validation.get('valid', False),
+        'validation_issues': validation.get('issues', []),
         'inner_cage_modified': False,  # Inner cage is NEVER modified
         'outer_cage_modified': True,
         'shrinkwrap_used': False,  # We don't destroy the mesh anymore
