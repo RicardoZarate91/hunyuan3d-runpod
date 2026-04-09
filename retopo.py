@@ -1,130 +1,135 @@
 #!/usr/bin/env python3
 """
-retopo.py — Retopologize a GLB/OBJ mesh to a target triangle count.
+retopo.py — Retopologize a mesh to a target triangle count.
 
-Uses PyMeshLab for quadric edge collapse decimation (much better quality
-than naive decimation). Also cleans up non-manifold geometry and makes
-the mesh watertight for Roblox compatibility.
+Uses Blender's Decimate modifier (headless) which preserves:
+  - UV maps and textures
+  - Materials and vertex colors
+  - Clean topology at high reduction ratios
+
+Falls back to trimesh + fast-simplification if Blender is not available
+(but trimesh strips UVs/textures).
 
 Usage:
-    python retopo.py input.glb output.glb --target-tris 4000
-    python retopo.py input.glb output.obj --target-tris 4000
+    python retopo.py --input input.glb --output output.glb --target-tris 4000
 """
 
 import argparse
+import subprocess
 import sys
 import os
+import json
+
+BLENDER_BIN = '/usr/bin/blender'
+
 
 def retopologize(input_path, output_path, target_tris=4000):
     """
-    Decimate mesh to target triangle count with quality preservation.
+    Decimate mesh to target triangle count, preserving textures.
 
-    Steps:
-    1. Load mesh
-    2. Remove duplicate vertices/faces
-    3. Remove non-manifold edges
-    4. Quadric edge collapse decimation to target
-    5. Smooth (light Laplacian)
-    6. Save
+    Uses Blender headless for UV/texture-preserving decimation.
+    Falls back to trimesh if Blender is unavailable.
     """
-    import pymeshlab
+    blender_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'blender_decimate.py')
 
-    ms = pymeshlab.MeshSet()
-    ms.load_new_mesh(input_path)
+    if os.path.exists(BLENDER_BIN) and os.path.exists(blender_script):
+        return _retopo_blender(input_path, output_path, target_tris, blender_script)
+    else:
+        print("[retopo] Blender not available, falling back to trimesh (no texture preservation)")
+        return _retopo_trimesh(input_path, output_path, target_tris)
 
-    mesh = ms.current_mesh()
-    original_faces = mesh.face_number()
-    original_verts = mesh.vertex_number()
+
+def _retopo_blender(input_path, output_path, target_tris, blender_script):
+    """Run Blender headless decimation."""
+    cmd = [
+        BLENDER_BIN,
+        '--background',
+        '--python', blender_script,
+        '--',
+        '--input', input_path,
+        '--output', output_path,
+        '--target-tris', str(target_tris),
+    ]
+
+    print(f"[retopo] Running Blender decimate: {target_tris} target tris")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    # Parse stats from stdout
+    stats = None
+    for line in (result.stdout or '').split('\n'):
+        if line.startswith('RETOPO_STATS:'):
+            stats = json.loads(line[len('RETOPO_STATS:'):])
+        if '[blender_decimate]' in line:
+            print(line.strip())
+
+    if result.returncode != 0:
+        stderr_tail = (result.stderr or '')[-500:]
+        print(f"[retopo] Blender stderr: {stderr_tail}")
+        raise RuntimeError(f"Blender decimate failed (exit {result.returncode})")
+
+    if not os.path.exists(output_path):
+        raise RuntimeError("Blender decimate produced no output file")
+
+    if stats:
+        print(f"[retopo] Result: {stats['final_verts']} verts, {stats['final_faces']} tris ({stats['reduction_pct']}% reduction)")
+        return stats
+
+    # If we couldn't parse stats, return minimal info
+    return {
+        'original_faces': 0,
+        'original_verts': 0,
+        'final_faces': target_tris,
+        'final_verts': 0,
+        'reduction_pct': 0.0,
+    }
+
+
+def _retopo_trimesh(input_path, output_path, target_tris):
+    """Fallback: trimesh decimation (strips UVs/textures)."""
+    import trimesh
+
+    loaded = trimesh.load(input_path, force='mesh')
+    if isinstance(loaded, trimesh.Scene):
+        mesh = trimesh.util.concatenate(loaded.dump())
+    else:
+        mesh = loaded
+
+    original_faces = len(mesh.faces)
+    original_verts = len(mesh.vertices)
     print(f"[retopo] Input: {original_verts} vertices, {original_faces} faces")
 
-    # Step 1: Clean up geometry
-    print("[retopo] Cleaning geometry...")
-    ms.apply_filter('meshing_remove_duplicate_faces')
-    ms.apply_filter('meshing_remove_duplicate_vertices')
+    if original_faces <= target_tris:
+        print(f"[retopo] Already under target ({original_faces} <= {target_tris}), skipping")
+        mesh.export(output_path)
+        return {
+            'original_faces': original_faces,
+            'original_verts': original_verts,
+            'final_faces': original_faces,
+            'final_verts': original_verts,
+            'reduction_pct': 0.0,
+        }
 
-    # Remove unreferenced vertices
-    ms.apply_filter('meshing_remove_unreferenced_vertices')
+    print(f"[retopo] Decimating {original_faces} -> {target_tris} faces...")
+    decimated = mesh.simplify_quadric_decimation(face_count=target_tris)
 
-    # Remove zero-area faces
-    try:
-        ms.apply_filter('meshing_remove_null_faces')
-    except Exception:
-        pass  # Filter might not exist in all versions
+    final_faces = len(decimated.faces)
+    final_verts = len(decimated.vertices)
+    reduction = round((1 - final_faces / max(original_faces, 1)) * 100, 1)
+    print(f"[retopo] Output: {final_verts} verts, {final_faces} faces ({reduction}% reduction)")
 
-    # Step 2: Repair non-manifold (important for Roblox watertight requirement)
-    print("[retopo] Repairing non-manifold geometry...")
-    try:
-        ms.apply_filter('meshing_repair_non_manifold_edges')
-        ms.apply_filter('meshing_repair_non_manifold_vertices')
-    except Exception:
-        pass  # Best effort
-
-    # Step 3: Close holes (watertight)
-    print("[retopo] Closing holes...")
-    try:
-        ms.apply_filter('meshing_close_holes', maxholesize=100)
-    except Exception:
-        pass
-
-    mesh = ms.current_mesh()
-    cleaned_faces = mesh.face_number()
-    print(f"[retopo] After cleanup: {mesh.vertex_number()} vertices, {cleaned_faces} faces")
-
-    # Step 4: Decimate if needed
-    if cleaned_faces > target_tris:
-        print(f"[retopo] Decimating {cleaned_faces} -> {target_tris} faces...")
-
-        # Use quadric edge collapse — best quality decimation
-        ms.apply_filter('meshing_decimation_quadric_edge_collapse',
-                        targetfacenum=target_tris,
-                        qualitythr=0.5,
-                        preserveboundary=True,
-                        preservenormal=True,
-                        preservetopology=True,
-                        optimalplacement=True,
-                        planarquadric=True)
-
-        mesh = ms.current_mesh()
-        print(f"[retopo] After decimation: {mesh.vertex_number()} vertices, {mesh.face_number()} faces")
-    else:
-        print(f"[retopo] Already under target ({cleaned_faces} <= {target_tris}), skipping decimation")
-
-    # Step 5: Light smoothing to clean up decimation artifacts
-    print("[retopo] Light smoothing...")
-    try:
-        ms.apply_filter('apply_coord_laplacian_smoothing',
-                        stepsmoothnum=1,
-                        cotangentweight=True)
-    except Exception:
-        pass
-
-    # Step 6: Re-clean after decimation
-    ms.apply_filter('meshing_remove_duplicate_faces')
-    ms.apply_filter('meshing_remove_duplicate_vertices')
-
-    # Final stats
-    mesh = ms.current_mesh()
-    final_faces = mesh.face_number()
-    final_verts = mesh.vertex_number()
-    print(f"[retopo] Output: {final_verts} vertices, {final_faces} faces")
-    print(f"[retopo] Reduction: {original_faces} -> {final_faces} ({(1 - final_faces/max(original_faces,1))*100:.1f}%)")
-
-    # Save
-    ms.save_current_mesh(output_path)
-    print(f"[retopo] Saved to {output_path}")
-
+    decimated.export(output_path)
     return {
         'original_faces': original_faces,
         'original_verts': original_verts,
         'final_faces': final_faces,
         'final_verts': final_verts,
-        'reduction_pct': round((1 - final_faces / max(original_faces, 1)) * 100, 1),
+        'reduction_pct': reduction,
     }
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Retopologize mesh for Roblox')
-    parser.add_argument('--input', required=True, help='Input mesh file (GLB/OBJ/PLY)')
+    parser.add_argument('--input', required=True, help='Input mesh file (GLB/OBJ/PLY/STL)')
     parser.add_argument('--output', required=True, help='Output mesh file')
     parser.add_argument('--target-tris', type=int, default=4000,
                         help='Target triangle count (default: 4000)')

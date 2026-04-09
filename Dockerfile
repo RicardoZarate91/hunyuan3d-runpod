@@ -54,7 +54,9 @@ print('Models downloaded!')"
 # Copy our handler + Roblox pipeline
 COPY handler.py /app/handler.py
 COPY retopo.py /app/retopo.py
+COPY blender_decimate.py /app/blender_decimate.py
 COPY blender_postprocess.py /app/blender_postprocess.py
+COPY blender_accessory.py /app/blender_accessory.py
 COPY postprocess_clothing.py /app/postprocess_clothing.py
 
 # Copy Roblox templates (reuse from trellis2-runpod)

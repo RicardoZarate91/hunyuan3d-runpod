@@ -204,37 +204,29 @@ def handler(job):
 
 
 def _run_remesh(glb_path, work_dir, inp, result):
-    """Run retopology only (no caging/rigging)."""
+    """Run Blender-based retopology (preserves UVs/textures)."""
     target_tris = inp.get("target_tris", 4000)
-    print(f"[hunyuan3d] Remesh-only: target={target_tris}")
+    print(f"[hunyuan3d] Remesh: target={target_tris} (Blender decimation)")
 
     try:
-        import trimesh as _trimesh
-        mesh = _trimesh.load(glb_path)
-        obj_path = os.path.join(work_dir, "input.obj")
-        mesh.export(obj_path)
-
-        retopo_out = os.path.join(work_dir, "remeshed.obj")
-        subprocess.run(
-            ["python3", "/app/retopo.py", "--input", obj_path,
-             "--output", retopo_out, "--target-tris", str(target_tris)],
-            capture_output=True, text=True, timeout=60, check=True,
-        )
-
-        remeshed = _trimesh.load(retopo_out)
+        from retopo import retopologize
         remesh_glb = os.path.join(work_dir, "remeshed.glb")
-        remeshed.export(remesh_glb)
+        stats = retopologize(glb_path, remesh_glb, target_tris)
 
         with open(remesh_glb, "rb") as f:
             data = f.read()
 
-        face_count = len(remeshed.faces) if hasattr(remeshed, "faces") else 0
         result["remeshed_glb"] = {
             "filename": "remeshed.glb", "type": "base64",
             "data": base64.b64encode(data).decode(),
         }
-        result["remesh_meta"] = {"target_tris": target_tris, "final_faces": face_count}
-        print(f"[hunyuan3d] Remesh done: {face_count} faces, {len(data)} bytes")
+        result["remesh_meta"] = {
+            "target_tris": target_tris,
+            "original_faces": stats.get("original_faces", 0),
+            "final_faces": stats.get("final_faces", 0),
+            "reduction_pct": stats.get("reduction_pct", 0),
+        }
+        print(f"[hunyuan3d] Remesh done: {stats.get('final_faces', '?')} faces, {len(data)} bytes")
 
     except Exception as e:
         result["remesh_error"] = str(e)
@@ -242,7 +234,7 @@ def _run_remesh(glb_path, work_dir, inp, result):
 
 
 def _run_roblox_pipeline(glb_path, work_dir, inp, result):
-    """Run full Roblox layered clothing pipeline."""
+    """Run full Roblox layered clothing pipeline with Blender decimation."""
     clothing_type = inp.get("clothing_type", "shirt")
     target_tris = inp.get("target_tris", 4000)
     out_dir = os.path.join(work_dir, "roblox-output")
@@ -251,16 +243,28 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
     print(f"[hunyuan3d] Roblox pipeline: type={clothing_type}, tris={target_tris}")
 
     try:
+        # Step 1: Blender-based decimation (preserves UVs/textures)
+        print("[hunyuan3d] Step 1: Blender decimation...")
+        from retopo import retopologize
+        decimated_glb = os.path.join(work_dir, "decimated.glb")
+        retopo_stats = retopologize(glb_path, decimated_glb, target_tris)
+        print(f"[hunyuan3d] Decimated: {retopo_stats.get('original_faces','?')} → {retopo_stats.get('final_faces','?')} faces")
+
+        # Step 2: Roblox post-processing (cage, rig, FBX)
+        print("[hunyuan3d] Step 2: Roblox LC (cage + rig + FBX)...")
         pp_result = subprocess.run(
             ["python3", "/app/postprocess_clothing.py",
-             "--input", glb_path,
+             "--input", decimated_glb,
              "--output-dir", out_dir,
              "--clothing-type", clothing_type,
-             "--target-tris", str(target_tris)],
+             "--target-tris", str(target_tris),
+             "--skip-retopo"],  # Already decimated, skip retopo in postprocess
             capture_output=True, text=True, timeout=180,
         )
 
-        print(f"[hunyuan3d] Post-process stdout: {pp_result.stdout[-2000:]}")
+        if pp_result.stdout:
+            for line in pp_result.stdout.strip().split("\n")[-10:]:
+                print(f"  {line}")
         if pp_result.returncode != 0:
             print(f"[hunyuan3d] Post-process stderr: {pp_result.stderr[-1000:]}")
 
@@ -291,11 +295,14 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
                     "filename": "clothing_on_mannequin.glb", "type": "base64",
                     "data": base64.b64encode(f.read()).decode(),
                 }
-            print(f"[hunyuan3d] Mannequin preview: {os.path.getsize(mannequin_path)} bytes")
 
         if os.path.exists(meta_path):
             with open(meta_path) as f:
-                result["roblox_meta"] = json.load(f)
+                meta = json.load(f)
+            meta["retopo"] = retopo_stats  # Add decimation stats
+            result["roblox_meta"] = meta
+        else:
+            result["roblox_meta"] = {"retopo": retopo_stats}
 
     except Exception as e:
         result["roblox_error"] = str(e)
