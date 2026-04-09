@@ -47,6 +47,41 @@ import traceback
 shape_pipeline = None
 
 
+def get_weights_dir():
+    """Get or create the model weights directory.
+    Prefers /workspace/weights (RunPod network volume, persists across cold starts).
+    Falls back to /app/weights (container-local, re-downloads each cold start).
+    """
+    for base in ['/workspace/weights', '/app/weights']:
+        os.makedirs(base, exist_ok=True)
+        return base
+    return '/app/weights'
+
+
+def download_models():
+    """Download Omni model weights if not already cached."""
+    weights_dir = get_weights_dir()
+    omni_dir = os.path.join(weights_dir, 'Hunyuan3D-Omni')
+
+    # Check if already downloaded (look for a model file)
+    if os.path.exists(os.path.join(omni_dir, 'model', 'pytorch_model.bin')):
+        print(f"[omni] Model weights found at {omni_dir}")
+        return omni_dir
+
+    print(f"[omni] Downloading Hunyuan3D-Omni to {omni_dir}...")
+    t0 = time.time()
+
+    from huggingface_hub import snapshot_download
+    snapshot_download(
+        'tencent/Hunyuan3D-Omni',
+        local_dir=omni_dir,
+        ignore_patterns=['*_ema.bin'],  # Skip EMA weights to save space/time
+    )
+
+    print(f"[omni] Download complete in {time.time()-t0:.1f}s")
+    return omni_dir
+
+
 def load_models():
     """Load Hunyuan3D-Omni shape model. Called once on cold start."""
     global shape_pipeline
@@ -59,14 +94,15 @@ def load_models():
 
     import torch
 
-    print("[omni] Loading Hunyuan3D-Omni shape model...")
+    # Download if needed (cached on network volume for subsequent cold starts)
+    omni_dir = download_models()
+
+    print("[omni] Loading Hunyuan3D-Omni into VRAM...")
     t0 = time.time()
 
     from hy3dshape.pipelines import Hunyuan3DOmniSiTFlowMatchingPipeline
 
-    shape_pipeline = Hunyuan3DOmniSiTFlowMatchingPipeline.from_pretrained(
-        '/app/weights/Hunyuan3D-Omni',
-    )
+    shape_pipeline = Hunyuan3DOmniSiTFlowMatchingPipeline.from_pretrained(omni_dir)
 
     print(f"[omni] Shape model loaded in {time.time()-t0:.1f}s (10GB VRAM)")
 

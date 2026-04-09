@@ -44,11 +44,9 @@ RUN pip install --no-cache-dir \
 # Install RunPod SDK
 RUN pip install --no-cache-dir runpod
 
-# ── Download Omni shape model weights (~13GB, baked for fast cold starts) ──
-RUN python3 -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('tencent/Hunyuan3D-Omni', local_dir='/app/weights/Hunyuan3D-Omni'); \
-print('Omni shape model downloaded!')"
+# Model weights are downloaded on first boot (too large for GH Actions disk).
+# On RunPod, use a network volume mounted at /workspace to cache models.
+# The handler downloads to /workspace/weights/ on cold start if not present.
 
 # Copy our handler + Roblox pipeline
 COPY handler.py /app/handler.py
