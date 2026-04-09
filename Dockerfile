@@ -42,8 +42,7 @@ RUN pip install --no-cache-dir \
     safetensors huggingface_hub hf_transfer \
     imageio pillow psutil \
     open3d==0.19.0 cupy-cuda12x==13.4.1 \
-    realesrgan pytorch-lightning==1.9.5 \
-    bpy==4.0
+    realesrgan pytorch-lightning==1.9.5
 
 # Build CUDA extensions for Paint pipeline (texture generation)
 # Omni (shape) needs NO CUDA extensions
@@ -88,6 +87,6 @@ ENV PYOPENGL_PLATFORM=egl
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
 
 # Make both packages importable
-ENV PYTHONPATH="/app/omni:/app/paint:${PYTHONPATH}"
+ENV PYTHONPATH="/app/omni:/app/paint"
 
 CMD ["python3", "/app/handler.py"]
