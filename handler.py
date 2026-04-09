@@ -1,14 +1,23 @@
 """
-RunPod Serverless Handler for Hunyuan3D-2.0 Image-to-3D.
+RunPod Serverless Handler for Hunyuan3D-Omni (shape) + Paint-v2-1 (texture).
+
+Omni adds controllable generation: bbox, pose, point cloud, voxel.
+Paint-v2-1 adds PBR textures (albedo, normal, metallic/roughness).
 
 Input:
   image: base64-encoded image (with or without data: prefix)
   seed: int (default 42)
-  steps: int (default 5)
-  guidance_scale: float (default 5.0)
-  octree_resolution: int (default 256)
+  steps: int (default 30)
+  guidance_scale: float (default 4.5)
+  octree_resolution: int (default 512)
   texture: bool (default true)
-  face_count: int (default 40000)
+  face_count: int (default 90000)
+  # Omni control signals (optional, pick one)
+  control_type: str (none|bbox|pose|point|voxel, default "none")
+  bbox: [w, h, d] — bounding box proportions
+  pose: [[x1,y1,z1,x2,y2,z2], ...] — bone segments
+  point: [[x,y,z], ...] — point cloud
+  voxel: [[x,y,z], ...] — surface samples (81920 points)
   # Post-processing
   remesh_only: bool (default false)
   roblox_postprocess: bool (default false)
@@ -40,41 +49,47 @@ paint_pipeline = None
 
 
 def load_models():
-    """Load Hunyuan3D-2.0 models into VRAM. Called once on cold start."""
+    """Load Hunyuan3D-Omni (shape) + Paint-v2-1 (texture). Called once on cold start."""
     global shape_pipeline, paint_pipeline
 
     if shape_pipeline is not None:
         return
 
-    print("[hunyuan3d] Loading shape generation model...")
+    import sys
+    sys.path.insert(0, '/app/omni')
+    sys.path.insert(0, '/app/paint')
+    sys.path.insert(0, '/app/paint/hy3dpaint')
+
+    import torch
+
+    # ── Load Omni shape pipeline ──
+    print("[omni] Loading Hunyuan3D-Omni shape model...")
     t0 = time.time()
 
-    import sys
-    sys.path.insert(0, '/app')
+    from hy3dshape.pipelines import Hunyuan3DOmniSiTFlowMatchingPipeline
 
-    from hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline
-    from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-    shape_pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        '/app/weights/Hunyuan3D-2',
-        subfolder='hunyuan3d-dit-v2-0',
-        use_safetensors=True,
+    shape_pipeline = Hunyuan3DOmniSiTFlowMatchingPipeline.from_pretrained(
+        '/app/weights/Hunyuan3D-Omni',
     )
-    shape_pipeline.to('cuda')
 
-    print(f"[hunyuan3d] Shape model loaded in {time.time()-t0:.1f}s")
+    print(f"[omni] Shape model loaded in {time.time()-t0:.1f}s")
 
-    print("[hunyuan3d] Loading texture paint model...")
+    # ── Load Paint PBR texture pipeline ──
+    print("[omni] Loading Hunyuan3D Paint-v2-1 texture model...")
     t1 = time.time()
 
-    paint_pipeline = Hunyuan3DPaintPipeline.from_pretrained(
-        '/app/weights/Hunyuan3D-2',
-        subfolder='hunyuan3d-paint-v2-0',
-        use_safetensors=True,
-    )
+    try:
+        from textureGenPipeline import Hunyuan3DPaintPipeline, Hunyuan3DPaintConfig
 
-    print(f"[hunyuan3d] Paint model loaded in {time.time()-t1:.1f}s")
-    print(f"[hunyuan3d] All models ready ({time.time()-t0:.1f}s total)")
+        paint_config = Hunyuan3DPaintConfig(max_num_view=6, resolution=512)
+        paint_pipeline = Hunyuan3DPaintPipeline(paint_config)
+        print(f"[omni] Paint model loaded in {time.time()-t1:.1f}s")
+    except Exception as e:
+        print(f"[omni] WARNING: Paint pipeline failed to load: {e}")
+        print("[omni] Texture generation will be unavailable. Shape-only mode.")
+        paint_pipeline = None
+
+    print(f"[omni] All models ready ({time.time()-t0:.1f}s total)")
 
 
 def handler(job):
@@ -97,11 +112,12 @@ def handler(job):
 
     # Settings
     seed = inp.get("seed", 42)
-    steps = inp.get("steps", 5)
-    guidance_scale = inp.get("guidance_scale", 5.0)
-    octree_resolution = inp.get("octree_resolution", 256)
+    steps = inp.get("steps", 30)
+    guidance_scale = inp.get("guidance_scale", 4.5)
+    octree_resolution = inp.get("octree_resolution", 512)
     do_texture = inp.get("texture", True)
-    face_count = inp.get("face_count", 40000)
+    face_count = inp.get("face_count", 90000)
+    control_type = inp.get("control_type", "none")
 
     work_dir = tempfile.mkdtemp(prefix="hunyuan3d_")
     result = {}
@@ -115,43 +131,93 @@ def handler(job):
         from PIL import Image
         image = Image.open(image_path).convert("RGBA")
 
-        # ── Shape generation ──
-        print(f"[hunyuan3d] Generating shape (steps={steps}, seed={seed})...")
+        # ── Shape generation with Omni ──
+        print(f"[omni] Generating shape (steps={steps}, seed={seed}, control={control_type})...")
         t0 = time.time()
 
         import torch
-        torch.manual_seed(seed)
+        import numpy as np
 
-        mesh = shape_pipeline(
+        generator = torch.Generator('cuda').manual_seed(seed)
+
+        # Build control kwargs
+        control_kwargs = {}
+        if control_type == "bbox" and inp.get("bbox"):
+            bbox = torch.FloatTensor(inp["bbox"]).unsqueeze(0).unsqueeze(0).cuda().half()
+            control_kwargs["bbox"] = bbox
+            print(f"[omni] Bbox control: {inp['bbox']}")
+        elif control_type == "pose" and inp.get("pose"):
+            pose = torch.FloatTensor(inp["pose"]).unsqueeze(0).cuda().half()
+            control_kwargs["pose"] = pose
+            print(f"[omni] Pose control: {len(inp['pose'])} bones")
+        elif control_type == "point" and inp.get("point"):
+            point = torch.FloatTensor(inp["point"]).unsqueeze(0).cuda().half()
+            control_kwargs["point"] = point
+            print(f"[omni] Point cloud control: {len(inp['point'])} points")
+        elif control_type == "voxel" and inp.get("voxel"):
+            voxel = torch.FloatTensor(inp["voxel"]).unsqueeze(0).cuda().half()
+            control_kwargs["voxel"] = voxel
+            print(f"[omni] Voxel control: {len(inp['voxel'])} samples")
+
+        shape_result = shape_pipeline(
             image=image,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             octree_resolution=octree_resolution,
-        )[0]
+            mc_level=0,
+            generator=generator,
+            **control_kwargs,
+        )
+        mesh = shape_result['shapes'][0][0]  # trimesh.Trimesh
 
         shape_time = time.time() - t0
-        print(f"[hunyuan3d] Shape done in {shape_time:.1f}s")
+        print(f"[omni] Shape done in {shape_time:.1f}s, faces={len(mesh.faces)}")
 
-        # Export untextured GLB
+        # ── Smooth normals (fixes polygonal/faceted look) ──
+        import trimesh
+        try:
+            trimesh.smoothing.filter_taubin(mesh, iterations=3)
+            print(f"[omni] Applied Taubin smoothing (3 iterations)")
+        except Exception as e:
+            print(f"[omni] Taubin smoothing skipped: {e}")
+
+        # Force smooth vertex normals
+        if hasattr(mesh, 'vertex_normals'):
+            _ = mesh.vertex_normals
+            print(f"[omni] Smooth vertex normals computed")
+
+        # Export shape as OBJ (paint pipeline needs OBJ path)
+        shape_obj_path = os.path.join(work_dir, "shape.obj")
+        mesh.export(shape_obj_path)
+
+        # Also export untextured GLB
         untextured_path = os.path.join(work_dir, "untextured.glb")
-        mesh.export(untextured_path)
+        mesh.export(untextured_path, include_normals=True)
 
-        # ── Texture generation ──
+        # ── Texture generation with Paint-v2-1 ──
         tex_time = 0
+        glb_path = untextured_path
+
         if do_texture and paint_pipeline:
-            print("[hunyuan3d] Generating textures...")
+            print("[omni] Generating PBR textures...")
             t1 = time.time()
 
-            textured_mesh = paint_pipeline(mesh, image=image)
-
-            tex_time = time.time() - t1
-            print(f"[hunyuan3d] Texture done in {tex_time:.1f}s")
-
-            # Export textured GLB
-            glb_path = os.path.join(work_dir, "output.glb")
-            textured_mesh.export(glb_path)
-        else:
-            glb_path = untextured_path
+            try:
+                textured_path = os.path.join(work_dir, "output.glb")
+                paint_pipeline(
+                    mesh_path=shape_obj_path,
+                    image_path=image_path,
+                    output_mesh_path=textured_path,
+                    save_glb=True,
+                )
+                glb_path = textured_path
+                tex_time = time.time() - t1
+                print(f"[omni] PBR texture done in {tex_time:.1f}s")
+            except Exception as e:
+                print(f"[omni] Texture failed, using untextured: {e}")
+                tex_time = 0
+        elif do_texture and not paint_pipeline:
+            print("[omni] Paint pipeline not loaded, returning untextured mesh")
 
         # Read GLB
         with open(glb_path, "rb") as f:
@@ -164,7 +230,6 @@ def handler(job):
         }]
 
         # Count faces/vertices
-        import trimesh
         loaded = trimesh.load(glb_path)
         if hasattr(loaded, 'faces'):
             n_faces = len(loaded.faces)
@@ -185,10 +250,12 @@ def handler(job):
             "seed": seed,
             "steps": steps,
             "octree_resolution": octree_resolution,
-            "textured": do_texture,
+            "textured": do_texture and tex_time > 0,
+            "control_type": control_type,
+            "model": "hunyuan3d-omni",
         }
 
-        print(f"[hunyuan3d] GLB: {len(glb_data)} bytes, {n_faces} faces, {n_verts} verts")
+        print(f"[omni] GLB: {len(glb_data)} bytes, {n_faces} faces, {n_verts} verts")
 
         # ── Post-processing ──
         if inp.get("remesh_only", False):
@@ -198,7 +265,7 @@ def handler(job):
 
     except Exception as e:
         result["error"] = f"{e}\n{traceback.format_exc()}"
-        print(f"[hunyuan3d] ERROR: {e}")
+        print(f"[omni] ERROR: {e}")
 
     return result
 
@@ -206,7 +273,7 @@ def handler(job):
 def _run_remesh(glb_path, work_dir, inp, result):
     """Run Blender-based retopology (preserves UVs/textures)."""
     target_tris = inp.get("target_tris", 4000)
-    print(f"[hunyuan3d] Remesh: target={target_tris} (Blender decimation)")
+    print(f"[omni] Remesh: target={target_tris} (Blender decimation)")
 
     try:
         from retopo import retopologize
@@ -226,11 +293,11 @@ def _run_remesh(glb_path, work_dir, inp, result):
             "final_faces": stats.get("final_faces", 0),
             "reduction_pct": stats.get("reduction_pct", 0),
         }
-        print(f"[hunyuan3d] Remesh done: {stats.get('final_faces', '?')} faces, {len(data)} bytes")
+        print(f"[omni] Remesh done: {stats.get('final_faces', '?')} faces, {len(data)} bytes")
 
     except Exception as e:
         result["remesh_error"] = str(e)
-        print(f"[hunyuan3d] Remesh error: {e}")
+        print(f"[omni] Remesh error: {e}")
 
 
 def _run_roblox_pipeline(glb_path, work_dir, inp, result):
@@ -240,25 +307,25 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
     out_dir = os.path.join(work_dir, "roblox-output")
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"[hunyuan3d] Roblox pipeline: type={clothing_type}, tris={target_tris}")
+    print(f"[omni] Roblox pipeline: type={clothing_type}, tris={target_tris}")
 
     try:
         # Step 1: Blender-based decimation (preserves UVs/textures)
-        print("[hunyuan3d] Step 1: Blender decimation...")
+        print("[omni] Step 1: Blender decimation...")
         from retopo import retopologize
         decimated_glb = os.path.join(work_dir, "decimated.glb")
         retopo_stats = retopologize(glb_path, decimated_glb, target_tris)
-        print(f"[hunyuan3d] Decimated: {retopo_stats.get('original_faces','?')} → {retopo_stats.get('final_faces','?')} faces")
+        print(f"[omni] Decimated: {retopo_stats.get('original_faces','?')} -> {retopo_stats.get('final_faces','?')} faces")
 
         # Step 2: Roblox post-processing (cage, rig, FBX)
-        print("[hunyuan3d] Step 2: Roblox LC (cage + rig + FBX)...")
+        print("[omni] Step 2: Roblox LC (cage + rig + FBX)...")
         pp_result = subprocess.run(
             ["python3", "/app/postprocess_clothing.py",
              "--input", decimated_glb,
              "--output-dir", out_dir,
              "--clothing-type", clothing_type,
              "--target-tris", str(target_tris),
-             "--skip-retopo"],  # Already decimated, skip retopo in postprocess
+             "--skip-retopo"],
             capture_output=True, text=True, timeout=180,
         )
 
@@ -266,7 +333,7 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
             for line in pp_result.stdout.strip().split("\n")[-10:]:
                 print(f"  {line}")
         if pp_result.returncode != 0:
-            print(f"[hunyuan3d] Post-process stderr: {pp_result.stderr[-1000:]}")
+            print(f"[omni] Post-process stderr: {pp_result.stderr[-1000:]}")
 
         # Collect outputs
         fbx_path = os.path.join(out_dir, "clothing_roblox.fbx")
@@ -280,7 +347,7 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
                     "filename": "clothing_roblox.fbx", "type": "base64",
                     "data": base64.b64encode(f.read()).decode(),
                 }
-            print(f"[hunyuan3d] FBX: {os.path.getsize(fbx_path)} bytes")
+            print(f"[omni] FBX: {os.path.getsize(fbx_path)} bytes")
 
         if os.path.exists(preview_path):
             with open(preview_path, "rb") as f:
@@ -299,14 +366,14 @@ def _run_roblox_pipeline(glb_path, work_dir, inp, result):
         if os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
-            meta["retopo"] = retopo_stats  # Add decimation stats
+            meta["retopo"] = retopo_stats
             result["roblox_meta"] = meta
         else:
             result["roblox_meta"] = {"retopo": retopo_stats}
 
     except Exception as e:
         result["roblox_error"] = str(e)
-        print(f"[hunyuan3d] Roblox pipeline error: {e}")
+        print(f"[omni] Roblox pipeline error: {e}")
 
 
 # Start RunPod serverless worker
