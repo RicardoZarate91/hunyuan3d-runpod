@@ -39,8 +39,10 @@ RUN pip install --no-cache-dir \
     imageio pillow psutil
 
 # Build custom CUDA extensions (rasterizer + differentiable renderer)
-RUN cd /app/hy3dgen/texgen/custom_rasterizer && pip install -e . \
-    && cd /app/hy3dgen/texgen/differentiable_renderer && pip install -e .
+# --no-build-isolation: use system torch (pip's isolated build env can't find it)
+RUN python3 -c "import torch; print(f'PyTorch {torch.__version__}, CUDA: {torch.cuda.is_available()}')" \
+    && cd /app/hy3dgen/texgen/custom_rasterizer && pip install --no-build-isolation -e . \
+    && cd /app/hy3dgen/texgen/differentiable_renderer && pip install --no-build-isolation -e .
 
 # Install RunPod SDK
 RUN pip install --no-cache-dir runpod
