@@ -151,7 +151,8 @@ def handler(job):
 
         generator = torch.Generator('cuda').manual_seed(seed)
 
-        # Build control kwargs
+        # Build control kwargs — Omni REQUIRES at least one control signal
+        # Default to bbox [1,1,1] (cube proportions) when none specified
         control_kwargs = {}
         if control_type == "bbox" and inp.get("bbox"):
             bbox = torch.FloatTensor(inp["bbox"]).unsqueeze(0).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
@@ -169,6 +170,11 @@ def handler(job):
             voxel = torch.FloatTensor(inp["voxel"]).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
             control_kwargs["voxel"] = voxel
             print(f"[omni] Voxel control: {len(inp['voxel'])} samples")
+        else:
+            # Default: bbox [1,1,1] — uniform cube proportions (lets model decide shape)
+            bbox = torch.FloatTensor([1.0, 1.0, 1.0]).unsqueeze(0).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
+            control_kwargs["bbox"] = bbox
+            print(f"[omni] Default bbox control: [1, 1, 1]")
 
         # Omni pipeline expects a file path string, not a PIL Image
         shape_result = shape_pipeline(
