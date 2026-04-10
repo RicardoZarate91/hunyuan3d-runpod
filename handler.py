@@ -142,9 +142,6 @@ def handler(job):
         with open(image_path, "wb") as f:
             f.write(base64.b64decode(image_b64))
 
-        from PIL import Image
-        image = Image.open(image_path).convert("RGBA")
-
         # ── Shape generation with Omni ──
         print(f"[omni] Generating shape (steps={steps}, seed={seed}, control={control_type})...")
         t0 = time.time()
@@ -157,24 +154,25 @@ def handler(job):
         # Build control kwargs
         control_kwargs = {}
         if control_type == "bbox" and inp.get("bbox"):
-            bbox = torch.FloatTensor(inp["bbox"]).unsqueeze(0).unsqueeze(0).cuda().half()
+            bbox = torch.FloatTensor(inp["bbox"]).unsqueeze(0).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
             control_kwargs["bbox"] = bbox
             print(f"[omni] Bbox control: {inp['bbox']}")
         elif control_type == "pose" and inp.get("pose"):
-            pose = torch.FloatTensor(inp["pose"]).unsqueeze(0).cuda().half()
+            pose = torch.FloatTensor(inp["pose"]).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
             control_kwargs["pose"] = pose
             print(f"[omni] Pose control: {len(inp['pose'])} bones")
         elif control_type == "point" and inp.get("point"):
-            point = torch.FloatTensor(inp["point"]).unsqueeze(0).cuda().half()
+            point = torch.FloatTensor(inp["point"]).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
             control_kwargs["point"] = point
             print(f"[omni] Point cloud control: {len(inp['point'])} points")
         elif control_type == "voxel" and inp.get("voxel"):
-            voxel = torch.FloatTensor(inp["voxel"]).unsqueeze(0).cuda().half()
+            voxel = torch.FloatTensor(inp["voxel"]).unsqueeze(0).to(shape_pipeline.device).to(shape_pipeline.dtype)
             control_kwargs["voxel"] = voxel
             print(f"[omni] Voxel control: {len(inp['voxel'])} samples")
 
+        # Omni pipeline expects a file path string, not a PIL Image
         shape_result = shape_pipeline(
-            image=image,
+            image=image_path,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             octree_resolution=octree_resolution,
