@@ -125,6 +125,21 @@ def handler(job):
     if "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
 
+    # Fix base64 padding if needed
+    padding = len(image_b64) % 4
+    if padding:
+        image_b64 += "=" * (4 - padding)
+
+    # Validate base64 decodes to something
+    try:
+        image_bytes = base64.b64decode(image_b64)
+        print(f"[omni] Image decoded: {len(image_bytes)} bytes")
+    except Exception as e:
+        return {"error": f"Invalid base64 image: {e}"}
+
+    if len(image_bytes) < 100:
+        return {"error": f"Image too small ({len(image_bytes)} bytes), likely invalid"}
+
     # Settings
     seed = inp.get("seed", 42)
     steps = inp.get("steps", 30)
@@ -137,31 +152,18 @@ def handler(job):
     result = {}
 
     try:
-        # Save input image and load as numpy array
-        image_path = os.path.join(work_dir, "input.png")
-        with open(image_path, "wb") as f:
-            f.write(base64.b64decode(image_b64))
+        # Save input image — detect format from magic bytes for correct extension
+        from PIL import Image as PILImage
+        import io
+        pil_img = PILImage.open(io.BytesIO(image_bytes))
+        fmt = pil_img.format or 'PNG'
+        ext = {'JPEG': '.jpg', 'PNG': '.png', 'WEBP': '.webp'}.get(fmt, '.png')
+        image_path = os.path.join(work_dir, f"input{ext}")
+        pil_img.save(image_path)
+        print(f"[omni] Saved image: {pil_img.size}, format={fmt}, path={image_path}")
 
         import torch
         import numpy as np
-        import cv2
-
-        # Load image as numpy array (Omni preprocessor expects ndarray, not file path)
-        image_np = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-        if image_np is None:
-            # cv2 failed — try PIL as fallback
-            from PIL import Image as PILImage
-            pil_img = PILImage.open(image_path)
-            image_np = np.array(pil_img)
-            print(f"[omni] Loaded image via PIL: {image_np.shape}")
-        else:
-            # cv2 loads as BGR/BGRA — convert to RGB/RGBA
-            if len(image_np.shape) == 3:
-                if image_np.shape[2] == 4:
-                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2RGBA)
-                else:
-                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-            print(f"[omni] Loaded image via cv2: {image_np.shape}")
 
         # ── Shape generation with Omni ──
         print(f"[omni] Generating shape (steps={steps}, seed={seed}, control={control_type})...")
@@ -194,9 +196,9 @@ def handler(job):
             control_kwargs["bbox"] = bbox
             print(f"[omni] Default bbox control: [1, 1, 1]")
 
-        # Pass numpy array to Omni pipeline (preprocessor expects ndarray)
+        # Omni pipeline expects a file path string
         shape_result = shape_pipeline(
-            image=image_np,
+            image=image_path,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             octree_resolution=octree_resolution,
