@@ -137,17 +137,35 @@ def handler(job):
     result = {}
 
     try:
-        # Save input image
+        # Save input image and load as numpy array
         image_path = os.path.join(work_dir, "input.png")
         with open(image_path, "wb") as f:
             f.write(base64.b64decode(image_b64))
 
+        import torch
+        import numpy as np
+        import cv2
+
+        # Load image as numpy array (Omni preprocessor expects ndarray, not file path)
+        image_np = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if image_np is None:
+            # cv2 failed — try PIL as fallback
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(image_path)
+            image_np = np.array(pil_img)
+            print(f"[omni] Loaded image via PIL: {image_np.shape}")
+        else:
+            # cv2 loads as BGR/BGRA — convert to RGB/RGBA
+            if len(image_np.shape) == 3:
+                if image_np.shape[2] == 4:
+                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGRA2RGBA)
+                else:
+                    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+            print(f"[omni] Loaded image via cv2: {image_np.shape}")
+
         # ── Shape generation with Omni ──
         print(f"[omni] Generating shape (steps={steps}, seed={seed}, control={control_type})...")
         t0 = time.time()
-
-        import torch
-        import numpy as np
 
         generator = torch.Generator('cuda').manual_seed(seed)
 
@@ -176,9 +194,9 @@ def handler(job):
             control_kwargs["bbox"] = bbox
             print(f"[omni] Default bbox control: [1, 1, 1]")
 
-        # Omni pipeline expects a file path string, not a PIL Image
+        # Pass numpy array to Omni pipeline (preprocessor expects ndarray)
         shape_result = shape_pipeline(
-            image=image_path,
+            image=image_np,
             num_inference_steps=steps,
             guidance_scale=guidance_scale,
             octree_resolution=octree_resolution,
